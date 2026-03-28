@@ -10,7 +10,7 @@
 
 | Task | Status | Agent | Notes |
 |------|--------|-------|-------|
-| 1. Write failing tests | NOT STARTED | — | — |
+| 1. Write failing tests | ✅ COMPLETE | inline | 6/6 unit pass, integration FAIL (TDD red). Cleanup bug killed hub TG — needs /mcp |
 | 2. Apply singleton lock patch | NOT STARTED | — | — |
 | 3. Create idempotent patch script | NOT STARTED | — | — |
 | 4. Add SessionStart hook | NOT STARTED | — | — |
@@ -27,3 +27,11 @@
 ## Implementation Notes (for resume + after-action review)
 
 *(Updated as tasks complete)*
+
+### Task 1 Notes (2026-03-28)
+- Unit test suite: 6/6 pass (T1-T6 all green)
+- Integration test: correctly fails (TDD red — patch not applied yet)
+- **BUG IN TEST:** test-no-duplicate.sh cleanup logic killed ALL bun processes including hub's. The `pgrep -P $HUB_PID` returned empty because HUB_PID was the claude process, not the direct bun parent. Need to fix cleanup to be smarter.
+- **LESSON:** Integration tests that touch live processes need MORE careful cleanup. The cleanup script should verify it's NOT killing the only remaining process.
+- **RESUME POINT:** Task 1 complete. Task 2 next (apply patch). TG needs /mcp to restore first.
+- **BEST PRACTICE:** Always check process count AFTER cleanup and alert if it's 0.
