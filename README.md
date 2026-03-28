@@ -26,8 +26,9 @@
 - [14. Stress Test Results (Prototype)](#14-stress-test-results-prototype)
 - [15. Security Review](#15-security-review)
 - [16. Known Weaknesses of the Chosen Solution](#16-known-weaknesses-of-the-chosen-solution)
-- [17. Deployment](#17-deployment)
-- [18. References](#18-references)
+- [17. Risk Mitigations](#17-risk-mitigations)
+- [18. Deployment](#18-deployment)
+- [19. References](#19-references)
 
 ---
 
@@ -1024,7 +1025,37 @@ Being completely transparent about what this fix does NOT solve:
 
 ---
 
-## 17. Deployment
+## 17. Risk Mitigations
+
+Full details in [docs/risk-mitigations.md](docs/risk-mitigations.md).
+
+| Risk | Severity | Mitigation | Status |
+|------|----------|------------|--------|
+| **Patch overwritten by updates** | Medium | SessionStart hook runs `apply-patch.sh` on every start (same proven pattern as telegram-reactions.sh) | ✅ MITIGATED |
+| **#36800 harness respawn gap** | Low | Lock prevents concurrent polling. Early lock release (Risk 4 fix) eliminates handoff gap. Telegram buffers updates 24h. | ✅ MITIGATED |
+| **#37933 notification delivery** | High | **No automated fix possible.** Operator awareness protocol: if bot replies but ignores your messages → run `/mcp`. Watchdog alerts on total silence. | ⚠️ PARTIALLY MITIGATED |
+| **Stale detection timing window** | ~~Medium~~ Fixed | `releaseSingletonLock()` runs FIRST in `shutdown()` — lock released before bot.stop(), so replacement instance can start immediately. Timing window eliminated. | ✅ FIXED |
+
+### Risk 4 Fix: Early Lock Release
+
+The original patch held the lock socket open during the entire 2-second shutdown window. This meant a replacement instance could see the dying instance as "alive" and exit, leaving zero instances running.
+
+**Fix:** Added `releaseSingletonLock()` as the first action in `shutdown()`:
+
+```typescript
+function shutdown(): void {
+  if (shuttingDown) return
+  shuttingDown = true
+  releaseSingletonLock()  // ← Release lock BEFORE bot.stop()
+  // ... rest of shutdown
+}
+```
+
+This ensures the replacement instance can acquire the lock as soon as the old instance begins shutting down — zero-second handoff gap.
+
+---
+
+## 18. Deployment
 
 ### Apply the patch
 
@@ -1066,7 +1097,7 @@ ls -la ~/.claude/channels/telegram/telegram.sock
 
 ---
 
-## 18. References
+## 19. References
 
 - [anthropics/claude-code#38098](https://github.com/anthropics/claude-code/issues/38098) — Plugin auto-loads in all sessions
 - [anthropics/claude-code#36800](https://github.com/anthropics/claude-code/issues/36800) — Harness spawns duplicates mid-session

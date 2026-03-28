@@ -80,8 +80,8 @@ async function acquireSingletonLock(): Promise<boolean> {
   }
 
   return new Promise(resolve => {
-    const lockServer = createNetServer()
-    lockServer.on('error', (err: NodeJS.ErrnoException) => {
+    _lockServer = createNetServer()
+    _lockServer.on('error', (err: NodeJS.ErrnoException) => {
       if (err.code === 'EADDRINUSE') {
         process.stderr.write('telegram channel: lock socket in use, exiting\n')
         resolve(false)
@@ -91,7 +91,7 @@ async function acquireSingletonLock(): Promise<boolean> {
       process.stderr.write(`telegram channel: lock warning: ${err.message}\n`)
       resolve(true)
     })
-    lockServer.listen(LOCK_SOCKET, () => {
+    _lockServer.listen(LOCK_SOCKET, () => {
       process.stderr.write(`telegram channel: singleton lock acquired (PID ${process.pid})\n`)
       resolve(true)
     })
@@ -99,6 +99,17 @@ async function acquireSingletonLock(): Promise<boolean> {
     const cleanup = () => { try { unlinkSync(LOCK_SOCKET) } catch {} }
     process.on('exit', cleanup)
   })
+}
+
+// Expose lock server so shutdown() can close it first — eliminates the
+// timing window where a dying instance still holds the lock (Risk 4).
+let _lockServer: ReturnType<typeof createNetServer> | null = null
+function releaseSingletonLock(): void {
+  if (_lockServer) {
+    _lockServer.close()
+    _lockServer = null
+  }
+  try { unlinkSync(LOCK_SOCKET) } catch {}
 }
 
 if (!(await acquireSingletonLock())) {
@@ -676,6 +687,9 @@ let shuttingDown = false
 function shutdown(): void {
   if (shuttingDown) return
   shuttingDown = true
+  // Release singleton lock FIRST — allows replacement instance to start
+  // immediately instead of waiting for our 2s force-exit timer (Risk 4 fix).
+  releaseSingletonLock()
   process.stderr.write('telegram channel: shutting down\n')
   // bot.stop() signals the poll loop to end; the current getUpdates request
   // may take up to its long-poll timeout to return. Force-exit after 2s.
