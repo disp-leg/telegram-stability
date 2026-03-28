@@ -11,7 +11,7 @@
 | Task | Status | Agent | Notes |
 |------|--------|-------|-------|
 | 1. Write failing tests | ✅ COMPLETE | inline | 6/6 unit pass, integration FAIL (TDD red). Cleanup bug killed hub TG — needs /mcp |
-| 2. Apply singleton lock patch | NOT STARTED | — | — |
+| 2. Apply singleton lock patch | ✅ COMPLETE | inline | Both marketplace + cache patched. Markers verified. |
 | 3. Create idempotent patch script | NOT STARTED | — | — |
 | 4. Add SessionStart hook | NOT STARTED | — | — |
 | 5. Create watchdog + cron | NOT STARTED | — | — |
@@ -35,3 +35,9 @@
 - **LESSON:** Integration tests that touch live processes need MORE careful cleanup. The cleanup script should verify it's NOT killing the only remaining process.
 - **RESUME POINT:** Task 1 complete. Task 2 next (apply patch). TG needs /mcp to restore first.
 - **BEST PRACTICE:** Always check process count AFTER cleanup and alert if it's 0.
+
+### Task 2 Notes (2026-03-28)
+- Patch applied to marketplace and cache copies via python3 string replacement
+- Verified: 2 SINGLETON LOCK markers, 2 releaseSingletonLock refs, 2 acquireSingletonLock refs in each file
+- Running process NOT affected — patch takes effect on next /mcp or session restart
+- **RESUME POINT:** Task 2 complete. Task 3 next (patch script). Then Tasks 4-5 (hook + watchdog). Task 6 needs /mcp.
