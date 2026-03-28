@@ -296,64 +296,367 @@ Both are required for the channel to work, but the decoupling means every instan
 
 ---
 
-## 6. Proposed Fix Plan (3 Layers)
+## 6. Proposed Solutions (Ranked)
 
-### Layer 1: PREVENTION
+We identified **9 distinct approaches** ranging from quick patches to full architecture replacements. Each is evaluated on five criteria:
 
-**1a. Remove telegram from global `enabledPlugins`**
+- **Stability** — Does it actually solve the problem, or just manage symptoms?
+- **Effort** — How long to implement and test?
+- **Durability** — Does it survive plugin updates, CC version bumps, and config changes?
+- **CC Bug Immunity** — Does it withstand all three upstream bugs (#38098, #36800, #37933)?
+- **Preserves MCP Tools** — Can we still use reply, react, edit_message, download_attachment through the MCP plugin interface?
 
-The single highest-impact fix. Hub is started with `--channels plugin:telegram@claude-plugins-official` which loads the plugin. We may not also need it in `enabledPlugins`.
+### Ranking Summary
 
-**Test required:** Verify `--channels` alone provides:
-- Bot process starts ✓
-- MCP tools available (reply, react, edit_message, download_attachment) ✓
-- Inbound notifications via `notifications/claude/channel` ✓
+| Rank | Solution | Stability | Effort | Durability | CC Bug Immune | Preserves MCP Tools |
+|------|----------|-----------|--------|------------|---------------|---------------------|
+| 1 | B — Standalone Poller + launchd | ★★★★★ | Medium | ★★★★★ | Yes (all 3) | Yes (outbound only) |
+| 2 | D — Webhook Mode + Tailscale | ★★★★★ | Medium | ★★★★★ | Yes (all 3) | Partial |
+| 3 | E — Reverse Proxy Bot | ★★★★★ | High | ★★★★★ | Yes (all 3) | Yes (via shim) |
+| 4 | C — Unix Socket Lock (patch) | ★★★★☆ | Low | ★★☆☆☆ | Partial (#38098 + #36800, not #37933) | Yes |
+| 5 | A — Env Var Gate (patch) | ★★★★☆ | Low | ★★☆☆☆ | Partial (#38098, not #36800 or #37933) | Yes |
+| 6 | F — Settings Scope Trick | ★★★☆☆ | Low | ★★★★☆ | Partial (#38098, not #36800 or #37933) | Yes |
+| 7 | G — PID Lock File (patch) | ★★★☆☆ | Low | ★★☆☆☆ | Partial (race window) | Yes |
+| 8 | H — Watchdog + Guardian Scripts | ★★☆☆☆ | Low | ★★★★☆ | No (reactive, not preventive) | Yes |
+| 9 | I — OpenClaw Dedup Pattern | ★★★★☆ | High | ★★☆☆☆ | Partial (tolerates duplicates) | Yes |
 
-**Fallback:** If `enabledPlugins` is required alongside `--channels`, move it to a hub-only location (`/.claude/settings.local.json` — root directory, hub's working dir).
+---
 
-**1b. PID lock file in server.ts**
+### Solution B: Standalone Poller + launchd (RANK 1)
 
-Patch the plugin to refuse startup if another instance is alive:
-```typescript
-const LOCK_FILE = join(STATE_DIR, 'telegram.lock')
-if (existsSync(LOCK_FILE)) {
-  const lockPid = parseInt(readFileSync(LOCK_FILE, 'utf8'))
-  try { process.kill(lockPid, 0); process.exit(0) } catch {} // stale lock
-}
-writeFileSync(LOCK_FILE, String(process.pid))
-process.on('exit', () => unlinkSync(LOCK_FILE))
+**Concept:** Completely decouple the Telegram polling lifecycle from Claude Code. Run a standalone bun/node script as a macOS launchd daemon that handles ALL inbound message polling. The CC plugin handles outbound only.
+
+**Architecture:**
+```
+┌─────────────────────────────────────────────────┐
+│  launchd daemon (always running, auto-restart)   │
+│  ┌───────────────────────────────────────────┐   │
+│  │  telegram-poller.ts                       │   │
+│  │  - Polls getUpdates via grammy/Bot API    │   │
+│  │  - Writes messages to inbox/ directory    │   │
+│  │  - Single process, managed by OS          │   │
+│  └───────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────┘
+         │ writes to
+         ▼
+  ~/.claude/channels/telegram/inbox/
+         │ reads from (existing MCP plugin mechanism)
+         ▼
+┌─────────────────────────────────────────────────┐
+│  Claude Code (hub session)                       │
+│  - Telegram plugin with polling DISABLED         │
+│  - MCP tools (reply, react, edit) still work     │
+│  - Outbound goes through Bot API via MCP tools   │
+│  - Inbound arrives via inbox/ file watcher       │
+└─────────────────────────────────────────────────┘
 ```
 
-**1c. telegram-guardian.sh (replaces kill-competing-telegram.sh)**
+**How it works:**
+1. Write a standalone `telegram-poller.ts` (~100 lines) that polls `getUpdates` and writes incoming messages as JSON files to `~/.claude/channels/telegram/inbox/`
+2. Create a launchd plist (`~/Library/LaunchAgents/com.yuna.telegram-poller.plist`) that keeps exactly ONE instance running at all times, auto-restarts on crash, starts on login
+3. Patch the CC plugin (server.ts) with an env var gate (`TELEGRAM_POLL=0`) so it loads MCP tools but never calls `bot.start()`. Set this env var in global settings.
+4. The CC plugin's existing inbox reader picks up messages from the standalone poller
 
-Identifies hub by `--channels` flag (not tmux session name), kills everything else. Runs as SessionStart hook AND cron.
+**Why this is #1:**
+- **launchd guarantees exactly one process** — OS-level singleton, no race conditions, no PID files
+- **Survives everything** — CC crashes, TeamCreate, /mcp reconnect, plugin updates (poller is separate from plugin)
+- **Immune to all 3 CC bugs** — poller lifecycle is completely independent of CC process model
+- **Preserves existing MCP tools** — reply, react, edit_message still work through the plugin
+- **Auto-restart on crash** — launchd restarts the poller within seconds if it dies
+- **Survives reboots** — launchd starts it on login
 
-### Layer 2: DETECT & KILL
+**Risks:**
+- Need to verify the existing inbox directory mechanism works for message delivery to CC
+- Env var gate patch gets overwritten on plugin updates (but poller itself is durable)
+- Two moving parts (poller + patched plugin) instead of one
 
-**2a. Watchdog cron (every 30 seconds)**
+**Effort:** ~2-3 hours (write poller, create plist, patch plugin, test)
 
-- Counts telegram processes → kills extras via guardian
-- Detects zombies (ppid=1) → kills them
-- Detects zero processes → alerts
-- Sends alerts via Bot API (works even when MCP is broken)
+---
 
-**2b. Fixed comms-check.sh**
+### Solution D: Webhook Mode + Tailscale Funnel (RANK 2)
 
-- Fix process counting bug
-- Identify correct process by parent chain, not by newest PID
-- Add lock file verification
-- Add MCP pipe health check
+**Concept:** Switch from long-polling to webhooks. Telegram pushes updates to a single HTTPS endpoint instead of us polling. Only ONE webhook URL can be registered per bot token — this is **protocol-level singleton enforcement**.
 
-### Layer 3: ALERT
+**Architecture:**
+```
+Telegram API
+    │ pushes updates via HTTPS POST
+    ▼
+┌──────────────────────────────────┐
+│  Tailscale Funnel / CF Tunnel    │
+│  (public HTTPS → local port)     │
+└──────────────────────────────────┘
+    │
+    ▼
+┌──────────────────────────────────┐
+│  Webhook server (launchd daemon) │
+│  - Receives POST /webhook        │
+│  - Writes to inbox/ directory    │
+│  - OR forwards to CC via stdio   │
+└──────────────────────────────────┘
+    │
+    ▼
+  Claude Code (reads inbox)
+```
 
-**3a. Bot API alerts to group chat**
+**How it works:**
+1. Run a lightweight webhook HTTP server (bun/node, ~80 lines) on localhost:8443
+2. Use Tailscale Funnel (`tailscale funnel 8443`) to expose it as a public HTTPS URL — we already have Tailscale installed
+3. Register the webhook URL with Telegram: `setWebhook(url=https://dispatchs-mac-mini.tail1234.ts.net/webhook)`
+4. Telegram sends all updates as HTTPS POSTs to this URL
+5. Webhook server writes messages to inbox/ or forwards to CC
 
-Watchdog sends alerts directly via `curl` to Telegram Bot API — works even when MCP is disconnected, plugin is crashed, or hub is frozen.
+**Why this is #2:**
+- **Protocol-level singleton** — Telegram only sends to ONE webhook URL. Impossible to have competing consumers.
+- **No polling at all** — eliminates the entire `getUpdates` / 409 Conflict problem class
+- **Instant delivery** — webhooks are push, not poll. Messages arrive in milliseconds, not on a 30s polling cycle.
+- **Immune to all 3 CC bugs** — webhook server is independent of CC
+- **Tailscale already installed** — Funnel is a built-in feature, no additional infrastructure
 
-Alert types:
-- `🔴 Telegram is DOWN` — zero processes
-- `⚠️ Killed N duplicate(s)` — watchdog cleaned up
-- `⚠️ Killed orphaned zombie` — ppid=1 detected
+**Risks:**
+- Tailscale Funnel availability — Mac Mini must be online and Tailscale connected
+- HTTPS certificate management (Tailscale handles this automatically)
+- Webhook server must be always-running (launchd handles this)
+- If Mac goes to sleep, webhook deliveries fail (Telegram retries, but with delays)
+- Slightly more infrastructure than Option B
+
+**Effort:** ~2-3 hours (write webhook server, configure Tailscale Funnel, register webhook, test)
+
+---
+
+### Solution E: Reverse Proxy Bot (RANK 3)
+
+**Concept:** Run a full-featured bot process (Python or Node) as a launchd daemon that owns the entire Telegram connection. CC communicates with this bot via local HTTP API or Unix socket. The bot is a persistent intermediary that never dies when CC restarts.
+
+**Architecture:**
+```
+┌─────────────────────────────────────────────┐
+│  Reverse Proxy Bot (launchd daemon)          │
+│  - Owns Telegram connection (poll or webhook)│
+│  - Exposes local API: POST /send, /react     │
+│  - Queues outbound if CC is disconnected     │
+│  - Writes inbound to inbox/ for CC           │
+│  - Manages conversation state                │
+└─────────────────────────────────────────────┘
+       ▲ local HTTP        │ writes inbox/
+       │                   ▼
+┌─────────────────────────────────────────────┐
+│  Claude Code                                 │
+│  - Thin MCP shim replaces telegram plugin    │
+│  - reply/react/edit → HTTP to proxy bot      │
+│  - Inbound arrives via inbox/                │
+└─────────────────────────────────────────────┘
+```
+
+**Why this is #3:**
+- **Most robust architecture** — bot and CC are fully independent processes communicating via IPC
+- **Survives everything** — CC crashes, restarts, agent spawns, plugin updates
+- **Can queue messages** — if CC is down, bot can hold messages and deliver when CC comes back
+- **Full control** — we own the bot code, can add features (message formatting, media handling, rate limiting)
+- **Reference exists** — RichardAtCT/claude-code-telegram is a working implementation of this pattern
+
+**Risks:**
+- Highest implementation effort
+- Need to write or adapt a full bot + local API
+- MCP shim needs to translate CC tool calls to local API calls
+- More code to maintain
+
+**Effort:** ~4-6 hours (adapt RichardAtCT or write from scratch, create MCP shim, launchd plist, test)
+
+---
+
+### Solution C: Unix Socket Singleton Lock (RANK 4)
+
+**Concept:** Patch server.ts to bind a Unix domain socket before starting the polling loop. `bind()` is atomic — if another instance holds the socket, the call fails immediately. No race conditions, no stale lock files.
+
+**Implementation:**
+```typescript
+import { createServer } from 'net'
+
+const LOCK_SOCKET = join(STATE_DIR, 'telegram.sock')
+
+const lockServer = createServer()
+try {
+  // Try to bind — fails immediately if another instance holds it
+  lockServer.listen(LOCK_SOCKET)
+} catch {
+  process.stderr.write('telegram channel: another instance is running, exiting\n')
+  process.exit(0)
+}
+
+// Clean up socket on exit (OS also cleans up if process dies)
+process.on('exit', () => { try { unlinkSync(LOCK_SOCKET) } catch {} })
+```
+
+**Why this is #4:**
+- **Race-free** — `bind()` is atomic at the kernel level. Two processes cannot both succeed.
+- **Auto-cleanup** — if the process dies without cleanup, the socket file remains but `connect()` to it will fail, and we can detect + unlink the stale socket
+- **Low effort** — ~15 lines of code added to server.ts
+- **Preserves all MCP tools** — no architectural change
+
+**Risks:**
+- **Overwritten on plugin update** — must re-patch after every `telegram@claude-plugins-official` update
+- **Doesn't fix #36800** — if the harness kills the first instance and starts a second, the second gets the lock. The problem is the first one dying, not the second one starting.
+- **Doesn't fix #37933** — notification delivery bug is unrelated to duplicate pollers
+
+**Effort:** ~30 minutes (patch + test)
+
+---
+
+### Solution A: Environment Variable Gate (RANK 5)
+
+**Concept:** Patch server.ts to check for `TELEGRAM_POLL=1` before calling `bot.start()`. Only set this env var in the hub's tmux environment. TeamCreate teammates don't inherit tmux env vars — they get a fresh shell.
+
+**Implementation:**
+```typescript
+// Add before the bot.start() IIFE (line ~1009)
+if (process.env.TELEGRAM_POLL !== '1') {
+  process.stderr.write('telegram channel: TELEGRAM_POLL not set, skipping polling (tools only)\n')
+  // MCP server stays running — tools work, but no inbound messages
+} else {
+  void (async () => {
+    // ... existing bot.start() loop
+  })()
+}
+```
+
+Hub setup:
+```bash
+# In tmux yuna session
+export TELEGRAM_POLL=1
+claude --channels plugin:telegram@claude-plugins-official
+```
+
+**Why this is #5:**
+- **Stops TeamCreate problem** — teammates don't inherit tmux env, so they load tools but never poll
+- **Very low effort** — 5 lines of code + 1 env var
+- **Preserves all MCP tools** — non-polling instances still have reply, react, edit
+- **Clean separation** — intent is explicit: only the hub polls
+
+**Risks:**
+- **Overwritten on plugin update**
+- **Doesn't fix #36800** — spontaneous harness respawn may or may not inherit env vars (untested)
+- **Doesn't fix #37933**
+- **Fragile** — forgetting to set the env var = no inbound messages with no error
+
+**Effort:** ~15 minutes (patch + test)
+
+---
+
+### Solution F: Settings Scope Trick (RANK 6)
+
+**Concept:** Use Claude Code's settings inheritance to disable telegram for everything except the hub, without patching the plugin.
+
+**Implementation:**
+1. Remove `"telegram@claude-plugins-official": true` from global `~/.claude/settings.json`
+2. Rely solely on `--channels plugin:telegram@claude-plugins-official` to load the plugin for the hub
+3. If `--channels` alone isn't sufficient, create a root-level project settings file with telegram enabled
+
+**Why this is #6:**
+- **No patches** — survives plugin updates
+- **Zero code changes** — pure configuration
+- **Stops TeamCreate, nodes, and CLI spawns** — they all read global settings
+
+**Risks:**
+- **UNTESTED** — we do not know if `--channels` alone loads the plugin AND provides MCP tools. If it doesn't, this breaks the hub.
+- **Doesn't fix #36800** — harness can still respawn the plugin mid-session
+- **Doesn't fix #37933**
+- If it works, it's the fastest fix. If it doesn't, we need fallback.
+
+**Effort:** ~10 minutes to test, ~2 minutes to implement if it works
+
+---
+
+### Solution G: PID Lock File (RANK 7)
+
+**Concept:** Patch server.ts to write a PID file on startup and refuse to start if another live process holds it.
+
+**Why this is #7:**
+- **Has a race window** — two processes can read "no lock" simultaneously, both write their PID, both proceed
+- **Stale locks require cleanup** — if process dies without removing lock, next startup must detect and clear it
+- **Overwritten on plugin update**
+- **Simpler but weaker than Unix socket lock (Solution C)**
+
+**Effort:** ~20 minutes
+
+---
+
+### Solution H: Watchdog + Guardian Scripts (RANK 8)
+
+**Concept:** The "3-layer defense" from the original plan — kill scripts, cron watchdogs, Bot API alerts.
+
+This is what we originally proposed. It includes:
+- `telegram-guardian.sh` — identifies hub by `--channels` flag, kills everything else
+- Watchdog cron every 30s — counts processes, kills duplicates, detects zombies
+- Bot API alerts to group chat when problems detected
+- Fixed `comms-check.sh` with proper heuristics
+
+**Why this is #8:**
+- **Reactive, not preventive** — damage happens, then gets cleaned up 0-30s later
+- **30-second gap** — messages can be lost in the window between duplicate spawn and watchdog detection
+- **Cannot detect #37933** — notification delivery failures are invisible to process monitoring
+- **Multiple scripts to maintain** — guardian, watchdog, comms-check, cron entries
+
+**This is damage control, not a fix.** However, it's valuable as a **supplementary layer** on top of any other solution. Even with the best singleton enforcement, a watchdog that alerts when Telegram goes down is always useful.
+
+**Effort:** ~1 hour
+
+---
+
+### Solution I: OpenClaw Dedup Pattern (RANK 9)
+
+**Concept:** Instead of preventing multiple pollers, tolerate them. Implement update offset persistence and deduplication so that even if multiple processes poll, each message is processed exactly once.
+
+**Implementation requires:**
+- Patching grammy's polling layer to persist `lastUpdateId` to disk
+- Adding in-flight deduplication (track which update IDs are being processed)
+- Adding in-memory dedup as secondary guard
+- Ensuring only the MCP-connected process handles each message
+
+**Why this is #9:**
+- **Highest complexity** — requires deep patches to grammy internals
+- **Doesn't solve the MCP pipe problem** — even with dedup, messages route to the wrong session if multiple processes are running. The process that wins the dedup race may not be the one with a working MCP pipe.
+- **Overwritten on plugin update**
+- **Philosophically elegant but practically insufficient** for our use case
+
+**Effort:** ~6-8 hours
+
+---
+
+### Previously Considered: Full Replacement Approaches
+
+#### RichardAtCT/claude-code-telegram (Agent SDK)
+
+A Python bot using the Claude Agent SDK instead of the MCP plugin. Architecturally immune to all CC bugs because the bot lifecycle is fully independent. However:
+- Requires Anthropic API key (additional cost beyond CC subscription)
+- No access to MCP tools (Playwright, Firecrawl, etc.) through Telegram
+- Significant migration effort
+- Different auth and session model
+
+**Verdict:** Nuclear option. Only worth it if ALL local mitigations fail AND upstream bugs aren't fixed.
+
+#### Discord Migration
+
+Discord plugin has the **same bugs** (confirmed in #36800 comments). Migration would not solve the underlying problem and would lose our existing Telegram setup.
+
+**Verdict:** Not a solution.
+
+---
+
+### Recommended Strategy: Layered Approach
+
+No single solution covers everything. The recommended implementation is:
+
+**Primary:** Solution B (Standalone Poller + launchd) — eliminates the root cause
+**Supplementary:** Solution H (Watchdog + Alerts) — catches edge cases, provides visibility
+**Quick win while building B:** Solution A or F — stops the bleeding immediately
+
+Implementation order:
+1. **Now (10 min):** Test Solution F (settings scope trick) — if `--channels` alone works, apply it immediately to stop TeamCreate spawns
+2. **Next (2-3 hrs):** Build Solution B (standalone poller) — the durable fix
+3. **Alongside B:** Deploy Solution H (watchdog + alerts) — supplementary monitoring
+4. **If B proves insufficient:** Evaluate Solution D (webhook mode) as upgrade path
 
 ---
 
@@ -400,34 +703,18 @@ The fundamental problem is that the Telegram plugin's lifecycle is **coupled to 
 
 ---
 
-## 9. Alternative Approaches Considered
+## 9. What Each Solution Does and Doesn't Fix
 
-### RichardAtCT/claude-code-telegram (Agent SDK approach)
+| Bug | B (Poller) | D (Webhook) | E (Proxy) | C (Socket) | A (Env) | F (Settings) | G (PID) | H (Watchdog) | I (Dedup) |
+|-----|-----------|-------------|-----------|------------|---------|-------------|---------|-------------|-----------|
+| #38098 — All instances poll | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ⚠️ race | ⚠️ reactive | ✅ |
+| #36800 — Spontaneous respawn | ✅ | ✅ | ✅ | ⚠️ first dies | ❌ | ❌ | ⚠️ race | ⚠️ reactive | ✅ |
+| #37933 — Notifications lost | ✅* | ✅* | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Survives plugin update | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | ✅ | ❌ |
+| Survives CC restart | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Zero message loss window | ✅ | ✅ | ✅ | ⚠️ brief | ⚠️ brief | ⚠️ brief | ⚠️ race | ⚠️ 30s gap | ✅ |
 
-A completely separate Telegram integration using the **Claude Agent SDK (Python)** instead of the official MCP plugin. Architecture: standalone Python bot → Claude Agent SDK → Claude API.
-
-**Pros:** Architecturally immune to all three CC harness bugs. Bot lifecycle is decoupled from CC processes. Single bot process manages its own polling. Session persistence via SDK.
-
-**Cons:** Requires Anthropic API key (costs money). Different auth model. No MCP integration (tools like Playwright, Firecrawl not available through Telegram). Significant migration effort.
-
-**Verdict:** Strong long-term option if MCP bugs aren't fixed upstream.
-
-### OpenClaw dedup pattern
-
-Rather than preventing multiple pollers, **tolerate them** with deduplication:
-- Update offset persistence (stores `lastUpdateId + botId` to disk)
-- In-flight deduplication (tracks which update IDs are being processed)
-- In-memory dedup as secondary guard
-
-**Pros:** Eliminates message loss even with multiple pollers. No need to prevent spawning.
-
-**Cons:** Requires patching the Grammy polling layer. Complex. May not solve the MCP pipe problem (messages still route to wrong session).
-
-**Verdict:** Elegant but high complexity. Better suited as an upstream fix.
-
-### Discord migration
-
-**Finding:** The Discord plugin has the **same bugs** (#36800 comments confirm duplicate spawning affects Discord too). Migration to Discord would not solve the underlying problem.
+*Solutions B and D bypass the MCP notification path entirely (using file-based IPC), which sidesteps #37933.
 
 ---
 
