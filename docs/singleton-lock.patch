@@ -1,0 +1,64 @@
+--- /tmp/tg-prototype/server-original.ts	2026-03-28 13:55:09
++++ /tmp/tg-prototype/server-patched.ts	2026-03-28 13:55:51
+@@ -51,7 +51,61 @@
+   process.exit(1)
+ }
+ const INBOX_DIR = join(STATE_DIR, 'inbox')
++
++// ── SINGLETON LOCK ─────────────────────────────────────────────────────
++// Only one telegram bot should poll per token. Bind a Unix domain socket
++// as an atomic lock — if another instance is alive, exit immediately.
++// This prevents 409 Conflict errors from competing getUpdates consumers.
++// See: https://github.com/anthropics/claude-code/issues/38098
++import { createServer as createNetServer, createConnection } from 'net'
++
++const LOCK_SOCKET = join(STATE_DIR, 'telegram.sock')
++
++async function acquireSingletonLock(): Promise<boolean> {
++  if (existsSync(LOCK_SOCKET)) {
++    const alive = await new Promise<boolean>(resolve => {
++      const client = createConnection(LOCK_SOCKET)
++      client.on('connect', () => { client.destroy(); resolve(true) })
++      client.on('error', () => resolve(false))
++      setTimeout(() => { client.destroy(); resolve(false) }, 500)
++    })
++    if (alive) {
++      process.stderr.write(
++        `telegram channel: another instance is running (socket lock held), exiting\n`,
++      )
++      return false
++    }
++    // Stale socket from crashed process — clean up
++    try { unlinkSync(LOCK_SOCKET) } catch {}
++  }
++
++  return new Promise(resolve => {
++    const lockServer = createNetServer()
++    lockServer.on('error', (err: NodeJS.ErrnoException) => {
++      if (err.code === 'EADDRINUSE') {
++        process.stderr.write('telegram channel: lock socket in use, exiting\n')
++        resolve(false)
++        return
++      }
++      // Non-lock error — proceed without lock (don't block startup)
++      process.stderr.write(`telegram channel: lock warning: ${err.message}\n`)
++      resolve(true)
++    })
++    lockServer.listen(LOCK_SOCKET, () => {
++      process.stderr.write(`telegram channel: singleton lock acquired (PID ${process.pid})\n`)
++      resolve(true)
++    })
++    // Clean up socket on exit
++    const cleanup = () => { try { unlinkSync(LOCK_SOCKET) } catch {} }
++    process.on('exit', cleanup)
++  })
++}
+ 
++if (!(await acquireSingletonLock())) {
++  process.exit(0)
++}
++// ── END SINGLETON LOCK ─────────────────────────────────────────────────
++
+ // Last-resort safety net — without these the process dies silently on any
+ // unhandled promise rejection. With them it logs and keeps serving tools.
+ process.on('unhandledRejection', err => {
