@@ -143,3 +143,102 @@ This means ANY solution that runs the telegram bot as a separate, independently-
 2. **Patch the MCP server to be smarter** (detect and refuse to poll if another instance is polling)
 3. **Replace the MCP server with one that handles the singleton problem** (custom plugin)
 4. **Accept the CC harness manages the process and focus on making it resilient** (dedup, graceful handoff)
+
+---
+
+## Test C: Unix Socket Singleton Lock
+
+**Hypothesis:** A Unix domain socket can enforce singleton behavior — only one bun telegram process can run at a time.
+
+**Method:** Wrote a bun test script that binds a Unix socket, then attempted to start a second instance.
+
+**Test 1 — Concurrent instances:**
+- Instance 1: `LOCK ACQUIRED: PID 19820`
+- Instance 2: `LOCK FAILED: another instance is alive` → exit code 1
+- Instance 1 still running: YES
+
+**Test 2 — Stale socket recovery (simulated crash):**
+- Created socket, then `process.exit(1)` without cleanup
+- Stale socket file remains on disk
+- New instance: connects to socket → ECONNREFUSED → detects stale → unlinks → acquires lock
+- Result: `LOCK ACQUIRED: PID 19921`
+
+**Result: VALIDATED.**
+
+Unix socket singleton works correctly:
+- Concurrent instances: second instance correctly rejected
+- Stale sockets: correctly detected and recovered
+- Connect-based liveness check avoids race conditions
+- No PID file needed — socket itself is the lock
+
+**Implementation for server.ts:** ~20 lines of code. Bind before `bot.start()`. Second instances exit immediately. Stale sockets cleaned via connect-test.
+
+---
+
+## Test F: --channels Without enabledPlugins
+
+**Hypothesis:** The `--channels` flag alone loads the telegram plugin and provides MCP tools, without needing `enabledPlugins: true`.
+
+**Method:** Created an isolated test directory with `settings.local.json` containing `"telegram@claude-plugins-official": false`. Launched `claude --channels plugin:telegram@claude-plugins-official -p "List all telegram MCP tools"` in that directory.
+
+**Result: INVALIDATED.**
+
+Output: "There are no telegram MCP tools available."
+
+**The `--channels` flag does NOT override `enabledPlugins: false`.** When enabledPlugins disables telegram, --channels cannot load it. Both are required:
+- `enabledPlugins: true` → starts the MCP server, registers tools
+- `--channels` → enables the push notification channel for inbound messages
+
+**Impact:**
+- Solution F (remove from global settings) WILL BREAK the hub's telegram
+- We CANNOT simply remove telegram from global settings
+- We MUST keep `enabledPlugins: true` somewhere the hub reads it
+- The fix must be: keep it enabled for hub, disabled for everything else
+
+**Revised approach for settings-based fix:**
+- Keep `telegram: true` in GLOBAL settings (hub needs it)
+- Add `telegram: false` to every non-hub context:
+  - Project-level settings for ALL project directories
+  - Node settings via start-spoke.sh (already done)
+  - TeamCreate teammate settings... but we can't control those
+  
+**The fundamental problem remains:** TeamCreate teammates read global settings and there's no mechanism to exclude specific plugins per-teammate.
+
+---
+
+## Revised Solution Rankings (Post-Validation)
+
+### Solutions INVALIDATED:
+- ~~B (Standalone Poller + launchd)~~ — inbox/ is attachments only, no message IPC path
+- ~~D (Webhook + Tailscale)~~ — same IPC problem
+- ~~E (Reverse Proxy Bot)~~ — same IPC problem
+- ~~A (Env Var Gate)~~ — teammates inherit tmux env
+- ~~F (Settings Trick)~~ — --channels doesn't override enabledPlugins
+
+### Solutions VALIDATED:
+- **C (Unix Socket Lock)** — PROVEN working in isolated test
+
+### Solutions UNTESTED but theoretically viable:
+- **G (PID Lock)** — similar to C but with race condition
+- **H (Watchdog Scripts)** — reactive only, but supplementary value
+- **I (OpenClaw Dedup)** — complex but theoretically sound
+
+### New Ranking:
+
+| Rank | Solution | Status | Rationale |
+|------|----------|--------|-----------|
+| 1 | **C (Unix Socket Lock)** | VALIDATED | Only tested solution that works. Patches server.ts to prevent concurrent instances. |
+| 2 | **C+H (Socket Lock + Watchdog)** | VALIDATED + KNOWN | Socket prevents duplicates, watchdog alerts when things go wrong. Defense in depth. |
+| 3 | **G (PID Lock)** | UNTESTED | Weaker version of C (has race window). Fallback if socket has edge cases. |
+| 4 | **Custom Plugin Fork** | NOT BUILT | Fork telegram plugin, add socket lock permanently, maintain as our own. Survives updates. |
+| 5 | **I (OpenClaw Dedup)** | UNTESTED | High complexity but tolerates duplicates instead of preventing them. |
+
+### The Durability Problem
+
+Solution C (Unix Socket Lock) is the only validated fix, but it has a critical weakness: **plugin updates overwrite server.ts**. Every time `telegram@claude-plugins-official` updates, we lose the patch.
+
+**Mitigation options:**
+1. **PostUpdateHook** — if CC has a hook that fires after plugin updates, re-apply the patch automatically
+2. **SessionStart hook** — check if patch is present on every session start, re-apply if missing
+3. **Fork the plugin** — maintain our own version with the fix baked in
+4. **Patch script in comms-check.sh** — verify + re-apply as part of diagnostics
