@@ -718,7 +718,114 @@ The fundamental problem is that the Telegram plugin's lifecycle is **coupled to 
 
 ---
 
-## 10. References
+## 10. Self-Audit: Systematic Debugging Review
+
+This section applies the [Systematic Debugging](https://github.com/anthropics/claude-plugins-official) skill framework to audit the quality of this entire report and plan. The framework requires completing four phases in order: Root Cause → Pattern Analysis → Hypothesis Testing → Implementation. Skipping phases is explicitly prohibited.
+
+### Phase 1 Audit: Root Cause Investigation
+
+**Status: MOSTLY COMPLETE, with gaps.**
+
+| Root Cause Activity | Done? | Quality |
+|---------------------|-------|---------|
+| Read error messages carefully | ✅ | Read server.ts source, mapped 409 retry loop, shutdown handlers |
+| Reproduce consistently | ⚠️ PARTIAL | Reproduced #38098 (TeamCreate) live with exact PIDs. Did NOT reproduce #36800 (spontaneous respawn) or #37933 (notification loss) — relied on community reports |
+| Check recent changes | ✅ | Traced 7+ drops over 10 hours with causes |
+| Gather evidence at component boundaries | ✅ | Mapped: settings.json → plugin load → bun spawn → bot.start() → getUpdates → 409 |
+| Trace data flow | ✅ | Traced full process tree, parent chains, stdin/stdout pipes |
+
+**Gap: 2 of 3 upstream bugs are accepted on faith from GitHub issues, not reproduced locally.** We should attempt to reproduce #36800 (run a clean session for 5+ minutes and monitor for spontaneous respawn) and #37933 (verify notification delivery with a known-working single-process setup).
+
+### Phase 2 Audit: Pattern Analysis
+
+**Status: INCOMPLETE.**
+
+| Pattern Activity | Done? | Quality |
+|------------------|-------|---------|
+| Find working examples | ⚠️ PARTIAL | Found: subagents safe, spoke nodes protected. Did NOT find working examples of any proposed solution. |
+| Compare against references | ⚠️ PARTIAL | Read OpenClaw and RichardAtCT approaches. Did NOT verify whether our inbox/ directory mechanism actually works for external IPC. |
+| Identify differences | ✅ | Clear comparison: subagent (in-process, safe) vs teammate (separate process, dangerous) |
+| Understand dependencies | ❌ | Did NOT verify how `--channels` interacts with `enabledPlugins`. Did NOT verify inbox/ read mechanism. Did NOT verify Tailscale Funnel availability. |
+
+**Gap: I compared the problem cases thoroughly but never validated that any proposed solution matches a known-working pattern.** The solutions are designed from reasoning alone, not from observed working behavior.
+
+### Phase 3 Audit: Hypothesis Testing
+
+**Status: NOT DONE. Zero solutions tested.**
+
+I proposed 9 ranked solutions without testing a single one. Each contains critical untested assumptions:
+
+| Solution | Rank | Critical Untested Assumption | Test Method | Time |
+|----------|------|------------------------------|-------------|------|
+| F (Settings Trick) | 6 | Does `--channels` alone load plugin + provide MCP tools without `enabledPlugins`? | Remove telegram from settings.json, restart hub with --channels only, check if tools work | 2 min |
+| A (Env Var Gate) | 5 | Do TeamCreate teammates inherit tmux-scoped env vars? | Set env var in tmux, spawn TeamCreate teammate, check env in teammate | 3 min |
+| B (Standalone Poller) | 1 | Does writing to inbox/ directory deliver messages to CC from an external process? | Write a test JSON file to inbox/, see if CC receives a `<channel>` tag | 2 min |
+| C (Unix Socket) | 4 | Does `net.createServer().listen(path)` prevent concurrent bun instances? | Run two bun scripts that try to bind same socket | 2 min |
+| D (Webhook) | 2 | Does Tailscale Funnel work on this machine? Is it enabled? | Run `tailscale funnel status` or `tailscale funnel 8443` | 1 min |
+| A (Env Var Gate) | 5 | Does the plugin still provide MCP tools if bot.start() is never called? | Patch server.ts to skip polling, check if reply/react tools appear | 5 min |
+
+**The framework says: "Form Single Hypothesis → Test Minimally → One variable at a time." I formed 9 hypotheses and tested none.**
+
+**Priority order for testing (smallest/fastest first):**
+1. Test F — `--channels` without `enabledPlugins` (2 min, validates/eliminates 3 solutions)
+2. Test B's inbox assumption — external write to inbox/ (2 min, validates/eliminates 3 solutions)
+3. Test A's env inheritance — tmux env in TeamCreate (3 min, validates/eliminates 1 solution)
+4. Test D's Tailscale Funnel availability (1 min, validates/eliminates 1 solution)
+
+### Phase 4 Audit: Implementation
+
+**Status: NOT STARTED.**
+
+No test cases created. No implementations built. No verifications run. The entire "plan" is theoretical.
+
+### The 3+ Failed Fixes Rule
+
+The systematic debugging framework states: *"If 3+ fixes failed, STOP and question the architecture."*
+
+**Fixes already attempted and failed:**
+
+| # | Fix | Result |
+|---|-----|--------|
+| 1 | kill-competing-telegram.sh | Doesn't prevent spawns, only kills after the fact |
+| 2 | comms-check.sh --fix | Wrong heuristic (keeps newest, not MCP-connected) |
+| 3 | spoke settings.local.json | Doesn't cover TeamCreate teammates |
+| 4 | Env var check in kill script | Teammates don't get the env var |
+| 5 | Manual process kills | Not sustainable, requires terminal access |
+
+**5 failed fixes.** The framework says this indicates an **architectural problem**, not a bug to patch around.
+
+**The architectural question:** *Is using the official MCP plugin for Telegram fundamentally sound, or are we persisting through inertia?*
+
+The evidence suggests the MCP plugin model is architecturally incompatible with our use case (multi-process hub with TeamCreate, agents, and nodes). The plugin was designed for single-session use. Our MSAP architecture creates multiple sessions. These are fundamentally at odds.
+
+Solutions B, D, and E (ranked 1-3) all answer this by **decoupling the bot from the plugin**. Solutions A, C, F, G (ranked 4-7) try to make the plugin work in an environment it wasn't designed for. Solution H (ranked 8) just manages the symptoms.
+
+### Honest Assessment of This Report
+
+| Section | Quality | What's Missing |
+|---------|---------|----------------|
+| Problem documentation | ★★★★★ | Nothing — well-evidenced |
+| Live reproduction | ★★★★★ | Nothing — exact PIDs, process trees |
+| First-principles source analysis | ★★★★☆ | Did not trace cli.js plugin loading code ourselves |
+| Upstream bug analysis | ★★★☆☆ | 2 of 3 bugs not locally reproduced |
+| Solution proposals | ★★★★☆ | Creative and thorough |
+| Solution validation | ★☆☆☆☆ | **Zero solutions tested** |
+| Rankings | ★★☆☆☆ | **Based on theory, not evidence** |
+| Implementation plan | ★☆☆☆☆ | **Does not exist** |
+
+### What Must Happen Before Implementation
+
+1. **Run the 4 validation tests** listed above (~10 minutes total)
+2. **Re-rank solutions** based on test results (some may be eliminated entirely)
+3. **Prototype the #1 ranked viable solution** in isolation
+4. **Stress test the prototype** against the 12-scenario matrix
+5. **Only then** deploy to production hub
+
+**Bottom line: This report is strong on investigation and weak on validation. The solutions are hypotheses, not answers. They need testing before any of them should be trusted.**
+
+---
+
+## 11. References
 
 - [anthropics/claude-code#38098](https://github.com/anthropics/claude-code/issues/38098) — Plugin auto-loads in all sessions
 - [anthropics/claude-code#36800](https://github.com/anthropics/claude-code/issues/36800) — Harness spawns duplicates mid-session
