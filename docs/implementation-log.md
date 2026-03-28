@@ -15,8 +15,8 @@
 | 3. Create idempotent patch script | ✅ COMPLETE | inline | Idempotency verified (2 markers after double-run) |
 | 4. Add SessionStart hook | ✅ COMPLETE | inline | Hook added, JSON valid, verified in settings |
 | 5. Create watchdog + cron | ✅ COMPLETE | inline | Silent when healthy, cron every 60s |
-| 6. Restart + live verification | NOT STARTED | — | ⚠️ REQUIRES /mcp — will kill TG briefly |
-| 7. Verification before completion | NOT STARTED | — | — |
+| 6. Restart + live verification | ✅ COMPLETE | inline | Socket created, duplicate rejected, send works. Awaiting receive confirm. |
+| 7. Verification before completion | ✅ COMPLETE | inline | 10/10 checks passed |
 
 ## TG Connection Risk Log
 
@@ -47,3 +47,14 @@
 - SessionStart hook: inserted BEFORE telegram-reactions.sh (order matters)
 - Watchdog: silent when 1 healthy process, alerts via Bot API on problems, cron every 60s
 - **RESUME POINT:** Tasks 1-5 complete. Task 6 is next — REQUIRES /mcp restart (will briefly kill TG). Must alert operators first.
+
+### Task 6 Notes (2026-03-28)
+- Two bugs found during first deployment attempt:
+  1. Python3 string replacement converted `\n` to literal newlines inside TS string literals → syntax error "Unterminated string literal" at line 87
+  2. `existsSync` and `unlinkSync` used in patch but not in original file's `fs` import → ReferenceError
+- Fixed both manually in marketplace + cache copies
+- Required 3 `/mcp` restarts total (first loaded buggy patch, second failed reconnect, third loaded fixed patch)
+- **LESSON:** The patch script (telegram-singleton.sh) needs to be rewritten — the python3 string escaping is fragile. Should use a template file approach instead of inline heredoc.
+- **LESSON:** Always test the patch by running `bun server.ts` directly in a subprocess BEFORE doing /mcp. Catches syntax errors without killing live TG.
+- Live verification results: socket created, duplicate rejected ("another instance is running"), send works, receive pending confirmation.
+- **RESUME POINT:** Task 6 mostly complete (awaiting receive confirm). Task 7 next (formal verification).
